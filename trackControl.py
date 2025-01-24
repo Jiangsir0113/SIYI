@@ -91,6 +91,8 @@ def send_home_command(ser):
 class VideoThread(QThread):
     change_pixmap = pyqtSignal(QImage)
     update_info = pyqtSignal(str)
+    tracking_status = pyqtSignal(bool)
+    target_selected = pyqtSignal(bool)
 
     def __init__(self, model_path, rtsp_url, serial_port):
         super().__init__()
@@ -103,15 +105,23 @@ class VideoThread(QThread):
         self.current_yaw = 0
         self.current_pitch = 0
         self.step_size = 5
+        self.tracking_enabled = False
+        self.target_center = None
+        self.centered_threshold = 30  # 阈值设为30像素
 
     def mouse_callback(self, x, y):
         self.selected_id = None
+        self.target_center = None
         for track in self.tracks:
             if not track.is_confirmed():
                 continue
             ltrb = track.to_ltrb()
             if ltrb[0] <= x <= ltrb[2] and ltrb[1] <= y <= ltrb[3]:
                 self.selected_id = track.track_id
+                self.target_center = ((ltrb[0] + ltrb[2]) // 2, (ltrb[1] + ltrb[3]) // 2)
+                self.target_selected.emit(True)
+                return
+        self.target_selected.emit(False)
 
     def run(self):
         control_gimbal(self.ser, self.current_yaw, self.current_pitch)
@@ -149,6 +159,7 @@ class VideoThread(QThread):
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(frame, f"Tracking ID: {track_id}", (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    self.target_center = ((x1 + x2) // 2, (y1 + y2) // 2)
                     info_text = f"跟踪目标ID: {track_id}\n坐标范围:\nX: {x1}-{x2}\nY: {y1}-{y2}"
 
             self.update_info.emit(info_text)
@@ -169,6 +180,50 @@ class VideoThread(QThread):
         self.current_pitch = 0
         send_home_command(self.ser)
 
+    def auto_track(self):
+        if not self.tracking_enabled or not self.target_center:
+            self.stop_auto_track()
+            return
+
+        W, H = 1920, 1080
+        frame_center = (W // 2, H // 2)
+        delta_x = self.target_center[0] - frame_center[0]
+        delta_y = self.target_center[1] - frame_center[1]
+
+        # 判断是否达到阈值
+        if abs(delta_x) < self.centered_threshold and abs(delta_y) < self.centered_threshold:
+            self.stop_auto_track()
+            return
+
+        alpha_x = 81.0 / W
+        alpha_y = 62.1 / H
+        delta_yaw = -delta_x * alpha_x
+        delta_pitch = -delta_y * alpha_y
+
+        new_yaw = max(min(self.current_yaw + delta_yaw, 135), -135)
+        new_pitch = max(min(self.current_pitch + delta_pitch, 25), -90)
+
+        if (new_yaw != self.current_yaw) or (new_pitch != self.current_pitch):
+            control_gimbal(self.ser, -new_yaw, -new_pitch)
+            self.current_yaw = new_yaw
+            self.current_pitch = new_pitch
+
+        # 单次计算后停止追踪
+        # self.stop_auto_track()
+
+    def start_auto_track(self):
+        if self.selected_id is None:
+            return
+        self.tracking_enabled = True
+        self.auto_track()
+
+    def stop_auto_track(self):
+        self.tracking_enabled = False
+        self.target_center = None
+        self.selected_id = None
+        self.tracking_status.emit(False)
+        self.target_selected.emit(False)
+
     def stop(self):
         self.running = False
         self.cap.release()
@@ -186,6 +241,8 @@ class MainWindow(QMainWindow):
         self.video_thread = VideoThread(model_path, rtsp_url, serial_port)
         self.video_thread.change_pixmap.connect(self.update_image)
         self.video_thread.update_info.connect(self.update_target_info)
+        self.video_thread.tracking_status.connect(self.update_tracking_status)
+        self.video_thread.target_selected.connect(self.update_selection_status)
 
         # 主界面布局
         main_widget = QWidget()
@@ -220,33 +277,54 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(self.info_label)
         right_layout.addWidget(info_frame)
 
-        # 控制面板
+        # 自动追踪控制面板
+        tracking_control_frame = QFrame()
+        tracking_control_frame.setStyleSheet("background-color: #FAFAFA; border-radius: 8px;")
+        tracking_layout = QHBoxLayout(tracking_control_frame)
+
+        self.btn_start_track = QPushButton("开始追踪")
+        self.btn_stop_track = QPushButton("停止追踪")
+        for btn in [self.btn_start_track, self.btn_stop_track]:
+            btn.setFixedHeight(45)
+            btn.setStyleSheet("""
+                QPushButton {
+                    font: bold 16px '微软雅黑';
+                    color: white;
+                    background-color: #2196F3;
+                    border-radius: 6px;
+                    padding: 8px;
+                }
+                QPushButton:hover { background-color: #1976D2; }
+                QPushButton:pressed { background-color: #0D47A1; }
+                QPushButton:disabled { background-color: #BBDEFB; }
+            """)
+        tracking_layout.addWidget(self.btn_start_track)
+        tracking_layout.addWidget(self.btn_stop_track)
+        right_layout.addWidget(tracking_control_frame)
+
+        # 手动控制面板
         control_frame = QFrame()
         control_frame.setStyleSheet("background-color: #FAFAFA; border-radius: 8px;")
         control_layout = QGridLayout(control_frame)
         control_layout.setContentsMargins(20, 20, 20, 20)
         control_layout.setSpacing(15)
 
-        # 创建控制按钮
         self.btn_home = self.create_control_button("回中", "home")
         self.btn_up = self.create_control_button("↑", "vertical")
         self.btn_down = self.create_control_button("↓", "vertical")
         self.btn_left = self.create_control_button("←", "horizontal")
         self.btn_right = self.create_control_button("→", "horizontal")
 
-        # 3x3网格布局
         control_layout.addWidget(self.btn_up, 0, 1)
         control_layout.addWidget(self.btn_left, 1, 0)
         control_layout.addWidget(self.btn_home, 1, 1)
         control_layout.addWidget(self.btn_right, 1, 2)
         control_layout.addWidget(self.btn_down, 2, 1)
 
-        # 设置行列伸缩比例
         control_layout.setRowStretch(0, 1)
         control_layout.setRowStretch(2, 1)
         control_layout.setColumnStretch(0, 1)
         control_layout.setColumnStretch(2, 1)
-
         right_layout.addWidget(control_frame)
 
         # 退出按钮
@@ -267,7 +345,6 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(exit_btn)
 
         main_layout.addWidget(right_panel, 1)
-
         self.setCentralWidget(main_widget)
 
         # 事件绑定
@@ -280,6 +357,12 @@ class MainWindow(QMainWindow):
         self.btn_left.released.connect(self.stop_move)
         self.btn_right.released.connect(self.stop_move)
         self.btn_home.clicked.connect(self.video_thread.return_home)
+        self.btn_start_track.clicked.connect(self.video_thread.start_auto_track)
+        self.btn_stop_track.clicked.connect(self.video_thread.stop_auto_track)
+
+        # 初始按钮状态
+        self.btn_start_track.setEnabled(False)
+        self.btn_stop_track.setEnabled(False)
 
         # 移动定时器
         self.move_timer = QTimer()
@@ -346,6 +429,15 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def update_target_info(self, info):
         self.info_label.setText(info)
+
+    @pyqtSlot(bool)
+    def update_tracking_status(self, is_tracking):
+        self.btn_start_track.setEnabled(not is_tracking)
+        self.btn_stop_track.setEnabled(is_tracking)
+
+    @pyqtSlot(bool)
+    def update_selection_status(self, has_selection):
+        self.btn_start_track.setEnabled(has_selection and not self.btn_stop_track.isEnabled())
 
     def get_pixel_position(self, event):
         x = event.pos().x()
